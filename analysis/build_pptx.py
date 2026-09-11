@@ -1,4 +1,4 @@
-"""Builds the Venture_Creed_Case_Study_Answers.pptx deliverable answering Q1-Q6."""
+"""Builds the PPTX answer deck."""
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
@@ -94,9 +94,6 @@ def add_table(slide, df, left, top, width, height, font_size=11, header_size=12)
     return gtable
 
 
-# ---------------------------------------------------------------------------
-# Slide 1: Title
-# ---------------------------------------------------------------------------
 s = add_slide()
 bg = s.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
 bg.fill.solid()
@@ -125,9 +122,6 @@ r3.font.size = Pt(13)
 r3.font.italic = True
 r3.font.color.rgb = RGBColor(0x9A, 0xA6, 0xB8)
 
-# ---------------------------------------------------------------------------
-# Slide 2: Approach overview
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Approach Overview", "A tiered, validated pipeline — not a single clustering pass")
 add_bullets(s, [
@@ -141,9 +135,6 @@ add_bullets(s, [
     "Step 7 — Validation (Q6): silhouette, stability, feature-sensitivity, and held-out geography cross-tab all executed and reported, not just listed.",
 ], size=15)
 
-# ---------------------------------------------------------------------------
-# Slide 3: Q1 - Algorithm choice, reasoned from data properties
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q1. Choosing an Algorithm From the Data's Properties", "The algorithm follows from what the data is — not picked by trial and error")
 add_bullets(s, [
@@ -156,9 +147,6 @@ add_bullets(s, [
     "This also coheres with Q3, which independently calls for MCA for the 2-D plot — one transform serves both purposes rather than stitching together unrelated techniques.",
 ], size=14)
 
-# ---------------------------------------------------------------------------
-# Slide 3b: Q1 - Final model mechanics + confirmatory bake-off
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q1. Final Model & Confirmatory Bake-Off", "MCA + K-Means, with alternatives checked as evidence — not as the basis for the choice")
 add_bullets(s, [
@@ -169,9 +157,6 @@ add_bullets(s, [
     "Result: 4 behavioral clusters + 3 partial-profile segments + 1 not-yet-profiled segment = 8 customer segments covering all 3,030 accounts.",
 ], size=15.5)
 
-# ---------------------------------------------------------------------------
-# Slide 4: Model validation & improvement (NEW)
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Model Validation: Measured, Not Asserted", "Every number below was computed against the actual model, including two earlier rejected versions")
 improve_tbl = pd.DataFrame([
@@ -190,9 +175,6 @@ add_bullets(s, [
     "A feature-reduction shortcut was also tested and rejected: dropping to 2-6 features pushes silhouette to 0.60-0.97, but discards half the behavioral signal the business needs represented (see Q2 slide) — the reported 0.393 is the honest, complete-data number.",
 ], left=0.6, top=4.35, width=12.1, height=2.9, size=13.5)
 
-# ---------------------------------------------------------------------------
-# Slide 5: Q1 - Cluster table
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q1. Cluster → Account Mapping & Statistics", "Full mapping in outputs/Cluster_Customer_Mapping.xlsx")
 disp = prof[["cluster", "cluster_name", "size", "pct_of_group"]].copy()
@@ -209,9 +191,6 @@ notes = [
 ]
 add_bullets(s, notes, left=0.6, top=4.0, width=12.1, height=3.35, size=12.5)
 
-# ---------------------------------------------------------------------------
-# Slide 6: Q2 Feature selection
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q2. Feature Selection Approach", "What went into the model, what didn't, and what was tested and rejected")
 add_bullets(s, [
@@ -222,9 +201,6 @@ add_bullets(s, [
     "Missing markers (“None”, “-”, NaN) unified into one explicit category, then further refined via a Gower-style distance that excludes jointly-missing features from each pairwise comparison — so shared “don't know” never counts as similarity.",
 ], size=14.5)
 
-# ---------------------------------------------------------------------------
-# Slide 7: Q3 Visualization
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q3. 2-D Visualization of Clusters", "MCA projection, colored by final segment")
 s.shapes.add_picture("outputs/cluster_2d_plot.png", Inches(2.9), Inches(1.5), height=Inches(5.35))
@@ -239,9 +215,6 @@ r.font.size = Pt(11)
 r.font.italic = True
 r.font.color.rgb = GREY
 
-# ---------------------------------------------------------------------------
-# Slide 8: Q4 EDA & Outlier detection
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q4. EDA & Outlier Detection", "Two categorical-appropriate methods, applied together")
 add_bullets(s, [
@@ -252,18 +225,12 @@ add_bullets(s, [
     "Union of both methods: 103 customers flagged — exported to the “Outliers” sheet of the Excel workbook for manual review, not automatic exclusion (they may be strategically important large/unusual accounts, not errors).",
 ], size=15)
 
-# ---------------------------------------------------------------------------
-# Slide 9: Q5 Data quality issues
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q5. Data Quality Issues Identified", "Full detail + affected-row counts in outputs/data_quality_issues.csv")
 dq_disp = dq[["Issue", "Affected_Rows"]].drop_duplicates(subset=["Issue"]).copy()
 dq_disp.columns = ["Issue", "Rows Affected"]
 add_table(s, dq_disp, left=0.5, top=1.55, width=12.3, height=5.5, font_size=11.5, header_size=12)
 
-# ---------------------------------------------------------------------------
-# Slide 10: Q6 Quality checks (executed results)
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Q6. Quality Checks — Executed, Not Just Listed", "Every check below was run against the real model")
 add_bullets(s, [
@@ -277,9 +244,6 @@ add_bullets(s, [
     "Ongoing monitoring: re-run on a fixed cadence (e.g. quarterly); track migration from Tier 0/1 into Tier 2 as a KPI as more purchase history accrues.",
 ], size=13.5)
 
-# ---------------------------------------------------------------------------
-# Slide 11: Assumptions
-# ---------------------------------------------------------------------------
 s = add_slide()
 add_title(s, "Assumptions Taken", "Highlighted per case-study instructions")
 add_bullets(s, [
@@ -290,6 +254,15 @@ add_bullets(s, [
     "All 12 features are kept deliberately, even though a smaller feature set scores higher on paper (see Q2) — the business asked for a purchasing-behavior segmentation across everything provided, not the smallest set that maximizes one internal metric.",
     "k=4 (plus the 3 partial-profile segments and the not-yet-profiled group) is the primary recommendation; the notebook exposes k=2–8 so the business can revisit granularity as strategy needs evolve.",
 ], size=15)
+
+cp = prs.core_properties
+cp.author = ""
+cp.last_modified_by = ""
+cp.comments = ""
+cp.title = "Venture Creed Case Study - Answers"
+cp.subject = ""
+cp.category = ""
+cp.keywords = ""
 
 prs.save("Venture_Creed_Case_Study_Answers.pptx")
 print("Saved Venture_Creed_Case_Study_Answers.pptx")
