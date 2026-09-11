@@ -1,0 +1,15 @@
+Issue,Detail,Affected_Rows
+Inconsistent missing-value encoding,"'Seasonality_Segment' mixes 2 distinct missing markers (string 'None'=1579, '-'=0, true NaN=748)",2327
+Inconsistent missing-value encoding,"'EA_Segment' mixes 2 distinct missing markers (string 'None'=2356, '-'=0, true NaN=189)",2545
+Inconsistent missing-value encoding,"'Density_Segment' mixes 2 distinct missing markers (string 'None'=0, '-'=623, true NaN=405)",1028
+High block-missingness in core behavioral segments,1789 of 3030 customers (59%) have ALL of Revenue/Profit/Market-Share/Casino-Size/Market-Potential/Churn segments unset ('None') simultaneously -> no purchasing-behavior signal available,1789
+Misspelled identifier values,Customer_ID values spelled 'Accoount N' instead of 'Account N',3030
+Placeholder text used inside categorical address fields,"'No Address Found' appears as a literal value in Street/City/State_Code/Country instead of a null, conflating a real category with missing data",220
+Literal string 'None' stored as Postal_Code value,421 rows store the text 'None' rather than a null,421
+Inconsistent text casing fragments identical categories,"231 distinct city names appear in multiple casings (e.g. 'LAS VEGAS' vs 'Las Vegas'), which would be treated as different categories/groups if not normalized",1771
+Duplicate customer records (identical on every field except ID),"Rows that are fully identical apart from Customer_ID - likely duplicate accounts, multiple properties billed as one, or an ID-generation artifact; needs business confirmation",480
+Multiple Customer_IDs sharing the exact same street address,Same physical address linked to more than one Customer_ID,398
+Missing State_Code,State/Province code not populated (also affects non-US/CAN countries without state concept),308
+No standardized postal-code format/validation,"Postal_Code mixes US 5-digit ZIPs, Canadian alphanumeric codes, and other/invalid formats with no validation rule",44
+Inconsistent ordinal scales across segment columns,"Segments encode order differently (e.g. L/M/H vs L/M/H/VH vs Low/Medium/High vs Minimal Change/Encouraging/Concerning) with no shared, documented ranking - requires manual harmonization before any distance-based modeling",3030
+No underlying numeric/continuous features provided,"All behavioral fields are pre-bucketed categories; the original continuous values (e.g. actual revenue, actual machine count) are not available, discarding within-bucket variance",3030

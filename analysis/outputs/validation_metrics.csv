@@ -1,0 +1,9 @@
+metric,value
+overall_silhouette_final_model,0.3932187197193898
+overall_silhouette_naive_baseline,0.20326215186591684
+pct_negative_silhouette,0.01195219123505976
+seed_stability_mean_ari,1.0
+seed_stability_min_ari,1.0
+chi2_vs_country,251.10913567651346
+p_value_vs_country,8.032067069783916e-47
+cramers_v_vs_country,0.318075609474654
