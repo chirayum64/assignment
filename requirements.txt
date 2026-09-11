@@ -1,0 +1,14 @@
+pandas
+pyarrow
+numpy
+scipy
+scikit-learn
+kmodes
+prince
+matplotlib
+openpyxl
+python-pptx
+jupyter
+nbformat
+nbconvert
+ipykernel
