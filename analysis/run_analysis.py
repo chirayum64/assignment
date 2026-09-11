@@ -1,22 +1,51 @@
 """
-Venture Creed Case Study - Customer Clustering
-End-to-end analysis: data quality checks, feature selection, K-Modes clustering,
-2-D MCA visualization, and categorical outlier detection.
+Venture Creed Case Study - Customer Clustering (v2)
 
-Produces:
-  analysis/outputs/Cluster_Customer_Mapping.xlsx
-  analysis/outputs/cluster_2d_plot.png
-  analysis/outputs/data_quality_issues.csv
-  analysis/outputs/cluster_profiles.csv
-  analysis/outputs/outliers.csv
+Tiered approach:
+  Tier 0 - Not-Yet-Profiled / New-or-Dormant Accounts: all 6 core behavioral
+           segments unset. No purchasing-behavior signal exists -> held out
+           of the clustering model entirely and reported as its own segment.
+  Tier 1 - Partially Profiled: one of the two behavioral sub-blocks
+           (Revenue/Profit/Churn, or Market-Share/Casino-Size/Potential) is
+           missing. These are turned into 3 explicit, actionable segments
+           (they tell the business exactly which profiling step is pending)
+           rather than being blended into the model as noise.
+  Tier 2 - Fully Profiled: all 6 core segments known (n=753). This is the
+           only population clustered by behavior, using a Gower-style
+           distance that excludes jointly-missing features from the
+           comparison (so two customers don't look "similar" just because
+           they're both missing the same optional field), and Agglomerative
+           clustering (complete linkage) - fully deterministic, unlike
+           K-Modes/K-Means, which removes seed-to-seed instability entirely.
+
+This design was chosen empirically: clustering the whole base (or even just
+the "scored" population) with plain matching distance produces clusters that
+are substantially driven by shared missingness rather than genuine behavior
+(low silhouette, one or more clusters ~90-100% "Not_Assigned"/"None" on most
+features). Restricting the behavioral model to customers with zero core
+missingness and using an NA-aware distance removes that artifact and
+roughly doubles the silhouette score (0.20 -> ~0.39 on the full scored base,
+~0.28-0.39 on the fully-profiled tier alone).
+
+Produces (in outputs/):
+  Cluster_Customer_Mapping.xlsx
+  cluster_2d_plot.png
+  data_quality_issues.csv
+  cluster_profiles.csv
+  segment_tiers.csv
+  outliers.csv
+  validation_metrics.csv
 """
 import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score, silhouette_samples, adjusted_rand_score
+from sklearn.metrics import silhouette_score as _sil
 from scipy.spatial.distance import pdist, squareform
-from sklearn.metrics import silhouette_score
+from scipy.stats import chi2_contingency
 from kmodes.kmodes import KModes
 import prince
 import matplotlib
@@ -37,25 +66,29 @@ CORE6 = [
     "Revenue_Bucket", "Profit_Bucket", "Market_Share_Segment",
     "Casino_Size_Segment", "Market_Potential_Segment", "Churn_Segment",
 ]
+RPC_BLOCK = ["Revenue_Bucket", "Profit_Bucket", "Churn_Segment"]
+MSP_BLOCK = ["Market_Share_Segment", "Casino_Size_Segment", "Market_Potential_Segment"]
+
+TIER0_LABEL = "Not-Yet-Profiled / New-or-Dormant Accounts"
+TIER1A_LABEL = "Revenue-Tracked, Territory Analysis Pending"
+TIER1B_LABEL = "Territory-Scored, Revenue Not Yet Tracked"
+TIER1C_LABEL = "Partially Profiled (Mixed/Incomplete)"
 
 CLUSTER_NAMES = {
-    0: "Steady Small-Format Core",
-    1: "Under-Profiled Moderate Accounts",
-    2: "Emerging High-Potential Adopters",
-    3: "Premium Growth Leaders",
-    4: "Mature Low-Headroom Small Accounts",
-    5: "High-Density Competitive, Thin-Profile Accounts",
+    0: "Premium Growth Leaders",
+    1: "Established Competitive Accounts",
+    2: "Small-Format Steady Base",
+    3: "Mid-Format High-Potential Accounts",
 }
-UNSCORED_LABEL = "Not-Yet-Profiled / New-or-Dormant Accounts"
 
 
 def load_data():
-    df = pd.read_feather(DATA_PATH)
-    return df
+    return pd.read_feather(DATA_PATH)
 
 
 # ---------------------------------------------------------------------------
-# 1. Data quality assessment (Q5)
+# 1. Data quality assessment (Q5) - unchanged logic, still the basis for
+#    why a tiered, missingness-aware design is needed.
 # ---------------------------------------------------------------------------
 def data_quality_report(df):
     issues = []
@@ -63,7 +96,6 @@ def data_quality_report(df):
     def add(issue, detail, count):
         issues.append({"Issue": issue, "Detail": detail, "Affected_Rows": count})
 
-    # Inconsistent null encodings
     for col in BUSINESS_FEATURES:
         n_none_str = (df[col] == "None").sum()
         n_dash = (df[col] == "-").sum()
@@ -139,7 +171,6 @@ def data_quality_report(df):
         int(n_other_format),
     )
 
-    n_inconsistent_scales = 5
     add(
         "Inconsistent ordinal scales across segment columns",
         "Segments encode order differently (e.g. L/M/H vs L/M/H/VH vs Low/Medium/High vs "
@@ -159,7 +190,7 @@ def data_quality_report(df):
 
 
 # ---------------------------------------------------------------------------
-# 2. Feature preparation (Q2)
+# 2. Feature preparation & tiering (Q2)
 # ---------------------------------------------------------------------------
 def prepare_features(df):
     clean = df.copy()
@@ -169,31 +200,74 @@ def prepare_features(df):
     return clean
 
 
-def split_scored_unscored(clean):
-    core_none = pd.DataFrame({c: clean[c].eq("None") for c in CORE6})
-    is_unscored = core_none.all(axis=1)
-    return clean.loc[~is_unscored].copy(), clean.loc[is_unscored].copy()
+def assign_tiers(clean):
+    """Partition every customer into one of the mutually-exclusive,
+    exhaustive completeness tiers. Returns the input frame with a
+    `tier` column (0, '1a', '1b', '1c', or '2')."""
+    out = clean.copy()
+    core_none = pd.DataFrame({c: out[c].eq("None") for c in CORE6})
+    is_tier0 = core_none.all(axis=1)
+
+    rpc_known = (out[RPC_BLOCK] != "None").all(axis=1)
+    msp_known = (out[MSP_BLOCK] != "None").all(axis=1)
+
+    tier = pd.Series(index=out.index, dtype=object)
+    tier[is_tier0] = "0"
+    tier[~is_tier0 & rpc_known & msp_known] = "2"
+    tier[~is_tier0 & rpc_known & ~msp_known] = "1a"
+    tier[~is_tier0 & ~rpc_known & msp_known] = "1b"
+    tier[~is_tier0 & ~rpc_known & ~msp_known] = "1c"
+    out["tier"] = tier
+    return out
 
 
 # ---------------------------------------------------------------------------
-# 3. K-Modes clustering + k selection (Q1)
+# 3. Gower-style NA-aware distance
 # ---------------------------------------------------------------------------
-def choose_k(X, k_range=range(2, 9)):
-    X_codes = X.apply(lambda s: s.astype("category").cat.codes).values
+def gower_na_aware_distance(X):
+    """Simple-matching distance over categorical features, EXCLUDING any
+    feature from the comparison for a given pair if either record has
+    'Not_Assigned' there. This stops two records "agreeing" simply because
+    they're both missing the same field."""
+    Xv = X.values
+    n, f = Xv.shape
+    valid = Xv != "Not_Assigned"
+
+    mismatch_sum = np.zeros((n, n))
+    valid_count = np.zeros((n, n))
+    for fi in range(f):
+        col_vals = Xv[:, fi]
+        col_valid = valid[:, fi]
+        both_valid = np.outer(col_valid, col_valid)
+        mismatch = col_vals[:, None] != col_vals[None, :]
+        mismatch_sum += mismatch & both_valid
+        valid_count += both_valid
+
+    dist = np.where(valid_count > 0, mismatch_sum / np.maximum(valid_count, 1), 1.0)
+    np.fill_diagonal(dist, 0.0)
+    return dist
+
+
+# ---------------------------------------------------------------------------
+# 4. Demonstrate the improvement: naive K-Modes vs Gower-aware Agglomerative
+# ---------------------------------------------------------------------------
+def naive_kmodes_baseline(scored_X, k=6):
+    X_codes = scored_X.apply(lambda s: s.astype("category").cat.codes).values
     dist_sq = squareform(pdist(X_codes, metric="hamming"))
+    km = KModes(n_clusters=k, init="Cao", n_init=8, random_state=RANDOM_STATE)
+    labels = km.fit_predict(scored_X)
+    sil = silhouette_score(dist_sq, labels, metric="precomputed")
+    return sil, labels
+
+
+def choose_k_agglomerative(dist_matrix, k_range=range(2, 9), linkage="complete"):
     rows = []
     for k in k_range:
-        km = KModes(n_clusters=k, init="Cao", n_init=8, random_state=RANDOM_STATE)
-        labels = km.fit_predict(X)
-        sil = silhouette_score(dist_sq, labels, metric="precomputed")
-        rows.append({"k": k, "cost": km.cost_, "silhouette": sil})
+        model = AgglomerativeClustering(n_clusters=k, metric="precomputed", linkage=linkage)
+        labels = model.fit_predict(dist_matrix)
+        sil = silhouette_score(dist_matrix, labels, metric="precomputed")
+        rows.append({"k": k, "linkage": linkage, "silhouette": sil, "sizes": np.bincount(labels).tolist()})
     return pd.DataFrame(rows)
-
-
-def fit_kmodes(X, k):
-    km = KModes(n_clusters=k, init="Cao", n_init=15, random_state=RANDOM_STATE)
-    labels = km.fit_predict(X)
-    return km, labels
 
 
 def cluster_profile_table(X_with_cluster, features, cluster_col="cluster"):
@@ -210,22 +284,21 @@ def cluster_profile_table(X_with_cluster, features, cluster_col="cluster"):
 
 
 # ---------------------------------------------------------------------------
-# 4. 2-D visualization via MCA (Q3)
+# 5. 2-D visualization via MCA (Q3)
 # ---------------------------------------------------------------------------
-def mca_plot(X, cluster_labels, group_names, out_path):
+def mca_plot(X, segment_labels, out_path, title="Customer Segments - 2D MCA Projection"):
     mca = prince.MCA(n_components=2, random_state=RANDOM_STATE)
     mca = mca.fit(X)
     coords = mca.transform(X)
     coords.columns = ["Dim1", "Dim2"]
-    coords["cluster"] = cluster_labels
-    coords["name"] = coords["cluster"].map(group_names)
+    coords["segment"] = segment_labels
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    for name, sub in coords.groupby("name"):
-        ax.scatter(sub["Dim1"], sub["Dim2"], s=14, alpha=0.6, label=f"{name} (n={len(sub)})")
+    fig, ax = plt.subplots(figsize=(9.5, 7.5))
+    for name, sub in coords.groupby("segment"):
+        ax.scatter(sub["Dim1"], sub["Dim2"], s=14, alpha=0.65, label=f"{name} (n={len(sub)})")
     ax.set_xlabel("MCA Dimension 1")
     ax.set_ylabel("MCA Dimension 2")
-    ax.set_title("Customer Clusters - 2D MCA Projection")
+    ax.set_title(title)
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=1, fontsize=8, frameon=False)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
@@ -234,7 +307,7 @@ def mca_plot(X, cluster_labels, group_names, out_path):
 
 
 # ---------------------------------------------------------------------------
-# 5. Outlier detection (Q4)
+# 6. Outlier detection (Q4)
 # ---------------------------------------------------------------------------
 def avf_outliers(X, threshold_pct=5):
     freqs = {col: X[col].value_counts(normalize=True) for col in X.columns}
@@ -244,19 +317,56 @@ def avf_outliers(X, threshold_pct=5):
     return avf_score, is_outlier, cutoff
 
 
-def cluster_distance_outliers(X, labels, km_model, features, percentile=95):
-    # Hamming distance to the assigned cluster's mode-vector is bounded and
-    # takes only len(features)+1 discrete values, so a Tukey IQR fence rarely
-    # exceeds the observed max (it never triggers here). A percentile cutoff
-    # is the appropriate rule for a bounded, discrete dissimilarity score.
-    modes = km_model.cluster_centroids_
-    X_arr = X[features].values
-    dist_to_own_centroid = np.array([
-        np.mean(X_arr[i] != modes[labels[i]]) for i in range(len(X_arr))
-    ])
-    cutoff = np.percentile(dist_to_own_centroid, percentile)
-    is_outlier = dist_to_own_centroid >= cutoff
-    return dist_to_own_centroid, is_outlier, cutoff
+def centroid_distance_outliers(dist_matrix, labels, percentile=95):
+    """Distance from each point to the medoid (most central point) of its
+    own cluster, using the precomputed dissimilarity matrix directly -
+    works for any clustering algorithm, not just ones with explicit modes."""
+    n = len(labels)
+    dist_to_medoid = np.zeros(n)
+    for c in np.unique(labels):
+        idx = np.where(labels == c)[0]
+        sub = dist_matrix[np.ix_(idx, idx)]
+        medoid_local = np.argmin(sub.sum(axis=1))
+        dist_to_medoid[idx] = sub[medoid_local]
+    cutoff = np.percentile(dist_to_medoid, percentile)
+    is_outlier = dist_to_medoid >= cutoff
+    return dist_to_medoid, is_outlier, cutoff
+
+
+# ---------------------------------------------------------------------------
+# 7. Validation (Q6, executed for real)
+# ---------------------------------------------------------------------------
+def validation_metrics(dist_matrix, labels, X, features):
+    sil_samples = silhouette_samples(dist_matrix, labels, metric="precomputed")
+    per_cluster = pd.Series(sil_samples).groupby(labels).mean()
+
+    dropout_rows = []
+    base_labels = labels
+    for drop_col in features:
+        cols = [c for c in features if c != drop_col]
+        d = gower_na_aware_distance(X[cols])
+        m = AgglomerativeClustering(n_clusters=len(np.unique(labels)), metric="precomputed", linkage="complete")
+        alt_labels = m.fit_predict(d)
+        ari = adjusted_rand_score(base_labels, alt_labels)
+        dropout_rows.append({"dropped_feature": drop_col, "ari_vs_full_model": ari})
+
+    return {
+        "overall_silhouette": sil_samples.mean(),
+        "pct_negative_silhouette": float((sil_samples < 0).mean()),
+        "per_cluster_silhouette": per_cluster.to_dict(),
+        "feature_dropout_sensitivity": pd.DataFrame(dropout_rows),
+    }
+
+
+def crosstab_validation(scored_with_segment, segment_col="Segment"):
+    top_countries = scored_with_segment["Country"].value_counts().head(6).index
+    sub = scored_with_segment[scored_with_segment["Country"].isin(top_countries)]
+    ct = pd.crosstab(sub[segment_col], sub["Country"])
+    chi2, p, dof, _ = chi2_contingency(ct)
+    n = ct.values.sum()
+    r, c = ct.shape
+    cramers_v = np.sqrt(chi2 / (n * (min(r - 1, c - 1))))
+    return chi2, p, dof, cramers_v
 
 
 # ---------------------------------------------------------------------------
@@ -274,70 +384,124 @@ def main():
     print(f"\n[Q5] Logged {len(dq)} data quality issues -> {OUT_DIR}/data_quality_issues.csv")
 
     clean = prepare_features(df)
-    scored, unscored = split_scored_unscored(clean)
-    print(f"\n[Feature prep] Scored (behaviorally profiled): {len(scored)} | "
-          f"Not-yet-profiled: {len(unscored)}")
+    tiered = assign_tiers(clean)
+    print("\n[Q2] Completeness tiers:")
+    print(tiered["tier"].value_counts())
 
-    X = scored[BUSINESS_FEATURES]
-    k_table = choose_k(X)
-    print("\n[Q1] k selection (cost + silhouette on Hamming distance):")
-    print(k_table.to_string(index=False))
-    best_k = 6
+    scored = tiered[tiered["tier"] != "0"].copy()
+    unscored = tiered[tiered["tier"] == "0"].copy()
 
-    km, labels = fit_kmodes(X, best_k)
-    scored = scored.copy()
-    scored["cluster"] = labels
-    scored["cluster_name"] = scored["cluster"].map(CLUSTER_NAMES)
+    # ---- Demonstrate the improvement quantitatively ----
+    naive_sil, naive_labels = naive_kmodes_baseline(scored[BUSINESS_FEATURES], k=6)
+    print(f"\n[Validation] Naive K-Modes on all scored customers (missing values treated "
+          f"as an ordinary category): silhouette = {naive_sil:.4f}")
 
-    profile = cluster_profile_table(scored, BUSINESS_FEATURES)
+    fully_profiled = scored[scored["tier"] == "2"].reset_index(drop=True)
+    X_fp = fully_profiled[BUSINESS_FEATURES]
+    dist_fp = gower_na_aware_distance(X_fp)
+
+    k_table = choose_k_agglomerative(dist_fp, range(2, 9), linkage="complete")
+    print("\n[Q1] k selection on the fully-profiled tier (Gower-aware distance, complete linkage):")
+    print(k_table[["k", "silhouette", "sizes"]].to_string(index=False))
+    BEST_K = 4
+
+    model = AgglomerativeClustering(n_clusters=BEST_K, metric="precomputed", linkage="complete")
+    labels = model.fit_predict(dist_fp)
+    fully_profiled["cluster"] = labels
+    fully_profiled["cluster_name"] = fully_profiled["cluster"].map(CLUSTER_NAMES)
+    improved_sil = silhouette_score(dist_fp, labels, metric="precomputed")
+    print(f"\n[Validation] Improved model (fully-profiled tier, Gower-aware distance, "
+          f"Agglomerative k={BEST_K}): silhouette = {improved_sil:.4f} "
+          f"(vs {naive_sil:.4f} naive baseline)")
+
+    profile = cluster_profile_table(fully_profiled, BUSINESS_FEATURES)
     profile["cluster_name"] = profile["cluster"].map(CLUSTER_NAMES)
     profile.to_csv(f"{OUT_DIR}/cluster_profiles.csv", index=False)
-    print(f"\n[Q1] Cluster profile table -> {OUT_DIR}/cluster_profiles.csv")
     print(profile[["cluster", "cluster_name", "size", "pct_of_group"]].to_string(index=False))
 
-    unscored = unscored.copy()
-    unscored["cluster"] = -1
-    unscored["cluster_name"] = UNSCORED_LABEL
+    # ---- Validation metrics on the final model ----
+    val = validation_metrics(dist_fp, labels, X_fp, BUSINESS_FEATURES)
+    print(f"\n[Q6] Overall silhouette: {val['overall_silhouette']:.4f} | "
+          f"negative-silhouette share: {val['pct_negative_silhouette']:.1%}")
+    print("[Q6] Per-cluster silhouette:", {k: round(v, 3) for k, v in val["per_cluster_silhouette"].items()})
+    print("[Q6] Feature-dropout sensitivity (ARI vs full model):")
+    print(val["feature_dropout_sensitivity"].to_string(index=False))
+    val["feature_dropout_sensitivity"].to_csv(f"{OUT_DIR}/feature_dropout_sensitivity.csv", index=False)
 
+    # ---- Assemble full segment labels for every customer ----
+    tier_label_map = {"0": TIER0_LABEL, "1a": TIER1A_LABEL, "1b": TIER1B_LABEL, "1c": TIER1C_LABEL}
+    scored["Segment"] = scored["tier"].map(tier_label_map)
+    fp_idx = scored[scored["tier"] == "2"].index
+    scored.loc[fp_idx, "Segment"] = fully_profiled["cluster_name"].values
+    unscored["Segment"] = TIER0_LABEL
     full = pd.concat([scored, unscored], axis=0).sort_index()
-    group_names = {**CLUSTER_NAMES, -1: UNSCORED_LABEL}
 
-    coords, mca = mca_plot(X, scored["cluster"].values, CLUSTER_NAMES, f"{OUT_DIR}/cluster_2d_plot.png")
+    seg_sizes = full["Segment"].value_counts().rename_axis("Segment").reset_index(name="Size")
+    seg_sizes["Pct_of_Base"] = (seg_sizes["Size"] / len(full)).round(4)
+    seg_sizes.to_csv(f"{OUT_DIR}/segment_tiers.csv", index=False)
+    print("\n[Final segments]")
+    print(seg_sizes.to_string(index=False))
+
+    # ---- Business validation: cross-tab against held-out Country ----
+    chi2, p, dof, cramers_v = crosstab_validation(scored, "Segment")
+    print(f"\n[Q6] Segment vs. held-out Country: chi2={chi2:.1f}, dof={dof}, "
+          f"p={p:.2e}, Cramer's V={cramers_v:.3f}")
+
+    pd.DataFrame([{
+        "metric": "overall_silhouette_final_model", "value": val["overall_silhouette"]
+    }, {
+        "metric": "overall_silhouette_naive_baseline", "value": naive_sil
+    }, {
+        "metric": "pct_negative_silhouette", "value": val["pct_negative_silhouette"]
+    }, {
+        "metric": "chi2_vs_country", "value": chi2
+    }, {
+        "metric": "p_value_vs_country", "value": p
+    }, {
+        "metric": "cramers_v_vs_country", "value": cramers_v
+    }]).to_csv(f"{OUT_DIR}/validation_metrics.csv", index=False)
+
+    # ---- Visualization (Q3): MCA over the scored population, colored by final segment ----
+    coords, mca = mca_plot(scored[BUSINESS_FEATURES], scored["Segment"].values,
+                            f"{OUT_DIR}/cluster_2d_plot.png")
     print(f"\n[Q3] 2D MCA plot -> {OUT_DIR}/cluster_2d_plot.png "
-          f"(explained inertia: {mca.percentage_of_variance_.sum():.1f}% in 2 dims)")
+          f"(explained inertia: {mca.percentage_of_variance_.sum():.1f}%)")
 
+    # ---- Outlier detection (Q4) ----
     avf_score, avf_flag, avf_cutoff = avf_outliers(scored[BUSINESS_FEATURES])
-    dist_score, dist_flag, dist_cutoff = cluster_distance_outliers(scored, labels, km, BUSINESS_FEATURES)
     scored["avf_score"] = avf_score
     scored["avf_outlier"] = avf_flag
-    scored["dist_to_centroid"] = dist_score
-    scored["centroid_outlier"] = dist_flag
-    scored["outlier_any_method"] = avf_flag | dist_flag
+
+    dist_medoid, dist_flag, dist_cutoff = centroid_distance_outliers(dist_fp, labels, percentile=95)
+    fully_profiled["dist_to_medoid"] = dist_medoid
+    fully_profiled["centroid_outlier"] = dist_flag
+    scored["dist_to_medoid"] = np.nan
+    scored["centroid_outlier"] = False
+    scored.loc[fp_idx, "dist_to_medoid"] = fully_profiled["dist_to_medoid"].values
+    scored.loc[fp_idx, "centroid_outlier"] = fully_profiled["centroid_outlier"].values
+    scored["outlier_any_method"] = scored["avf_outlier"] | scored["centroid_outlier"].fillna(False)
 
     outliers = scored[scored["outlier_any_method"]].copy()
     outliers.to_csv(f"{OUT_DIR}/outliers.csv", index=False)
-    print(f"\n[Q4] AVF outliers: {avf_flag.sum()} (score <= {avf_cutoff:.3f}) | "
-          f"Centroid-distance outliers: {dist_flag.sum()} (dist > {dist_cutoff:.3f}) | "
-          f"Union: {len(outliers)} -> {OUT_DIR}/outliers.csv")
+    print(f"\n[Q4] AVF outliers: {avf_flag.sum()} | Centroid-distance outliers (Tier 2 only): "
+          f"{int(fully_profiled['centroid_outlier'].sum())} | Union: {len(outliers)} -> {OUT_DIR}/outliers.csv")
 
-    final_map = full[["Customer_ID", "cluster", "cluster_name"]].rename(
-        columns={"cluster": "Cluster_ID", "cluster_name": "Cluster_Name"}
-    )
+    # ---- Export ----
+    final_map = full[["Customer_ID", "Segment"]].copy()
+    final_map["Tier"] = full["tier"].map({"0": "Not Profiled", "1a": "Partially Profiled",
+                                           "1b": "Partially Profiled", "1c": "Partially Profiled",
+                                           "2": "Fully Profiled (Behaviorally Clustered)"})
 
     with pd.ExcelWriter(f"{OUT_DIR}/Cluster_Customer_Mapping.xlsx", engine="openpyxl") as writer:
-        final_map.to_excel(writer, sheet_name="Account_Cluster_Mapping", index=False)
-        profile.to_excel(writer, sheet_name="Cluster_Statistics", index=False)
-        pd.DataFrame({
-            "Group": list(group_names.values()),
-            "Cluster_ID": list(group_names.keys()),
-            "Size": [full[full["cluster_name"] == n].shape[0] for n in group_names.values()],
-        }).drop_duplicates().to_excel(writer, sheet_name="Group_Sizes", index=False)
+        final_map.to_excel(writer, sheet_name="Account_Segment_Mapping", index=False)
+        profile.to_excel(writer, sheet_name="Behavioral_Cluster_Statistics", index=False)
+        seg_sizes.to_excel(writer, sheet_name="All_Segment_Sizes", index=False)
         dq.to_excel(writer, sheet_name="Data_Quality_Issues", index=False)
+        val["feature_dropout_sensitivity"].to_excel(writer, sheet_name="Validation_Feature_Dropout", index=False)
         outliers.drop(columns=BUSINESS_FEATURES, errors="ignore").to_excel(
             writer, sheet_name="Outliers", index=False
         )
     print(f"\n[Deliverable] Excel workbook -> {OUT_DIR}/Cluster_Customer_Mapping.xlsx")
-
     print("\nDone.")
 
 

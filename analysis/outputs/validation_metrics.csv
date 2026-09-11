@@ -1,0 +1,7 @@
+metric,value
+overall_silhouette_final_model,0.2747263594624071
+overall_silhouette_naive_baseline,0.20326215186591684
+pct_negative_silhouette,0.07304116865869854
+chi2_vs_country,237.8261055912985
+p_value_vs_country,4.700839804183334e-44
+cramers_v_vs_country,0.30954862097496316
