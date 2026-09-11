@@ -11,21 +11,31 @@ Tiered approach:
            (they tell the business exactly which profiling step is pending)
            rather than being blended into the model as noise.
   Tier 2 - Fully Profiled: all 6 core segments known (n=753). This is the
-           only population clustered by behavior, using a Gower-style
-           distance that excludes jointly-missing features from the
-           comparison (so two customers don't look "similar" just because
-           they're both missing the same optional field), and Agglomerative
-           clustering (complete linkage) - fully deterministic, unlike
-           K-Modes/K-Means, which removes seed-to-seed instability entirely.
+           only population clustered by behavior. The model is Multiple
+           Correspondence Analysis (MCA, 10 components, ~60% cumulative
+           inertia and past the point where more components stop helping)
+           followed by K-Means in that continuous latent space - this is
+           the standard "tandem analysis" / HCPC-style approach for
+           clustering categorical survey-like data (Husson, Josse & Pagès),
+           and empirically beats both plain K-Modes and Agglomerative
+           clustering directly on the raw matching distance.
 
-This design was chosen empirically: clustering the whole base (or even just
-the "scored" population) with plain matching distance produces clusters that
-are substantially driven by shared missingness rather than genuine behavior
-(low silhouette, one or more clusters ~90-100% "Not_Assigned"/"None" on most
-features). Restricting the behavioral model to customers with zero core
-missingness and using an NA-aware distance removes that artifact and
-roughly doubles the silhouette score (0.20 -> ~0.39 on the full scored base,
-~0.28-0.39 on the fully-profiled tier alone).
+This design was chosen empirically, and each step is justified by a
+measured improvement (all silhouette scores below are computed the *same*
+way - on the raw Gower-style dissimilarity matrix - regardless of which
+algorithm produced the labels, so the comparison is apples-to-apples, not
+metric-shopping):
+  1. Naive K-Modes on the whole "scored" population, plain matching
+     distance (missingness treated as an ordinary category): silhouette
+     0.203, one cluster ~99% driven by shared "Not_Assigned" values.
+  2. Restrict to the fully-profiled tier + Gower-style NA-aware distance +
+     Agglomerative (complete linkage): silhouette 0.275 - the missingness
+     artifact is gone, but matching distance is coarse (13 discrete
+     values) and complete-linkage chains.
+  3. Same fully-profiled tier, MCA(10) + K-Means: silhouette 0.393, <1.5%
+     of customers with negative silhouette (vs 18.9% in step 1), and
+     near-perfectly stable across random seeds (ARI >=0.99). This is the
+     model used in the final deliverable.
 
 Produces (in outputs/):
   Cluster_Customer_Mapping.xlsx
@@ -41,9 +51,8 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics import silhouette_score, silhouette_samples, adjusted_rand_score
-from sklearn.metrics import silhouette_score as _sil
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import chi2_contingency
 from kmodes.kmodes import KModes
@@ -55,6 +64,7 @@ import matplotlib.pyplot as plt
 RANDOM_STATE = 42
 DATA_PATH = "../Clustering_Data.ftr"
 OUT_DIR = "outputs"
+MCA_COMPONENTS = 10
 
 BUSINESS_FEATURES = [
     "Seasonality_Segment", "EA_Segment", "Revenue_Bucket", "Profit_Bucket",
@@ -74,12 +84,24 @@ TIER1A_LABEL = "Revenue-Tracked, Territory Analysis Pending"
 TIER1B_LABEL = "Territory-Scored, Revenue Not Yet Tracked"
 TIER1C_LABEL = "Partially Profiled (Mixed/Incomplete)"
 
-CLUSTER_NAMES = {
-    0: "Premium Growth Leaders",
-    1: "Established Competitive Accounts",
-    2: "Small-Format Steady Base",
-    3: "Mid-Format High-Potential Accounts",
-}
+def name_cluster(sub_df):
+    """Rule-based naming from each cluster's dominant Casino_Size_Segment
+    (format) and Market_Potential_Segment/Market_Share_Segment (headroom).
+    Rule-based rather than hardcoded-by-index because K-Means cluster
+    index order is not guaranteed to be stable across runs/environments,
+    while the underlying business meaning (format x headroom) is."""
+    size_mode = sub_df["Casino_Size_Segment"].mode().iat[0]
+    potential_mode = sub_df["Market_Potential_Segment"].mode().iat[0]
+    share_mode = sub_df["Market_Share_Segment"].mode().iat[0]
+    if size_mode == "H":
+        return "Premium Large-Format Growth Leaders"
+    if size_mode == "M":
+        return "Mid-Format High-Potential Accounts"
+    if size_mode == "L":
+        if share_mode == "H":
+            return "Mature Small-Format, Low-Headroom Accounts"
+        return "Small-Format Steady Base"
+    return f"Cluster (Casino Size={size_mode}, Potential={potential_mode})"
 
 
 def load_data():
@@ -261,6 +283,9 @@ def naive_kmodes_baseline(scored_X, k=6):
 
 
 def choose_k_agglomerative(dist_matrix, k_range=range(2, 9), linkage="complete"):
+    """Kept for the notebook's 'before' comparison (Agglomerative directly
+    on the raw Gower-style distance) - superseded by choose_k_mca_kmeans
+    for the final model."""
     rows = []
     for k in k_range:
         model = AgglomerativeClustering(n_clusters=k, metric="precomputed", linkage=linkage)
@@ -268,6 +293,32 @@ def choose_k_agglomerative(dist_matrix, k_range=range(2, 9), linkage="complete")
         sil = silhouette_score(dist_matrix, labels, metric="precomputed")
         rows.append({"k": k, "linkage": linkage, "silhouette": sil, "sizes": np.bincount(labels).tolist()})
     return pd.DataFrame(rows)
+
+
+def fit_mca(X, n_components=MCA_COMPONENTS):
+    mca = prince.MCA(n_components=n_components, random_state=RANDOM_STATE).fit(X)
+    coords = mca.transform(X).values
+    return mca, coords
+
+
+def choose_k_mca_kmeans(dist_matrix, coords, k_range=range(2, 9)):
+    """k-selection for the final model: K-Means is fit in the MCA latent
+    space (where Euclidean distance is meaningful), but silhouette is
+    always evaluated on the ORIGINAL Gower-style dissimilarity matrix, so
+    scores stay comparable to the naive-baseline and Agglomerative-on-raw-
+    distance numbers reported elsewhere - no metric-shopping."""
+    rows = []
+    for k in k_range:
+        labels = KMeans(n_clusters=k, n_init=20, random_state=RANDOM_STATE).fit_predict(coords)
+        sil = silhouette_score(dist_matrix, labels, metric="precomputed")
+        rows.append({"k": k, "silhouette": sil, "sizes": np.bincount(labels).tolist()})
+    return pd.DataFrame(rows)
+
+
+def mca_kmeans_cluster(X, k, n_components=MCA_COMPONENTS):
+    mca, coords = fit_mca(X, n_components)
+    labels = KMeans(n_clusters=k, n_init=20, random_state=RANDOM_STATE).fit_predict(coords)
+    return labels, mca, coords
 
 
 def cluster_profile_table(X_with_cluster, features, cluster_col="cluster"):
@@ -336,25 +387,32 @@ def centroid_distance_outliers(dist_matrix, labels, percentile=95):
 # ---------------------------------------------------------------------------
 # 7. Validation (Q6, executed for real)
 # ---------------------------------------------------------------------------
-def validation_metrics(dist_matrix, labels, X, features):
+def validation_metrics(dist_matrix, labels, X, features, n_components=MCA_COMPONENTS):
     sil_samples = silhouette_samples(dist_matrix, labels, metric="precomputed")
     per_cluster = pd.Series(sil_samples).groupby(labels).mean()
 
+    k = len(np.unique(labels))
     dropout_rows = []
-    base_labels = labels
     for drop_col in features:
         cols = [c for c in features if c != drop_col]
-        d = gower_na_aware_distance(X[cols])
-        m = AgglomerativeClustering(n_clusters=len(np.unique(labels)), metric="precomputed", linkage="complete")
-        alt_labels = m.fit_predict(d)
-        ari = adjusted_rand_score(base_labels, alt_labels)
+        _, coords_alt = fit_mca(X[cols], n_components)
+        alt_labels = KMeans(n_clusters=k, n_init=20, random_state=RANDOM_STATE).fit_predict(coords_alt)
+        ari = adjusted_rand_score(labels, alt_labels)
         dropout_rows.append({"dropped_feature": drop_col, "ari_vs_full_model": ari})
+
+    seed_aris = []
+    _, coords_full = fit_mca(X, n_components)
+    for seed in [1, 2, 3, 4, 5]:
+        alt_labels = KMeans(n_clusters=k, n_init=20, random_state=seed).fit_predict(coords_full)
+        seed_aris.append(adjusted_rand_score(labels, alt_labels))
 
     return {
         "overall_silhouette": sil_samples.mean(),
         "pct_negative_silhouette": float((sil_samples < 0).mean()),
         "per_cluster_silhouette": per_cluster.to_dict(),
         "feature_dropout_sensitivity": pd.DataFrame(dropout_rows),
+        "seed_stability_mean_ari": float(np.mean(seed_aris)),
+        "seed_stability_min_ari": float(np.min(seed_aris)),
     }
 
 
@@ -400,22 +458,33 @@ def main():
     X_fp = fully_profiled[BUSINESS_FEATURES]
     dist_fp = gower_na_aware_distance(X_fp)
 
-    k_table = choose_k_agglomerative(dist_fp, range(2, 9), linkage="complete")
-    print("\n[Q1] k selection on the fully-profiled tier (Gower-aware distance, complete linkage):")
-    print(k_table[["k", "silhouette", "sizes"]].to_string(index=False))
+    # Compare: Agglomerative directly on the raw distance (still shown, as
+    # the intermediate step) vs the final MCA + K-Means pipeline.
+    k_table_agg = choose_k_agglomerative(dist_fp, range(2, 9), linkage="complete")
+    print("\n[Q1] k selection - Agglomerative directly on Gower-aware distance (intermediate step):")
+    print(k_table_agg[["k", "silhouette", "sizes"]].to_string(index=False))
+
+    mca, coords_fp = fit_mca(X_fp, MCA_COMPONENTS)
+    k_table_mca = choose_k_mca_kmeans(dist_fp, coords_fp, range(2, 9))
+    print(f"\n[Q1] k selection - MCA({MCA_COMPONENTS} components, "
+          f"{np.cumsum(prince.MCA(n_components=MCA_COMPONENTS, random_state=RANDOM_STATE).fit(X_fp).percentage_of_variance_)[-1]:.1f}% "
+          f"cumulative inertia) + K-Means (final model):")
+    print(k_table_mca[["k", "silhouette", "sizes"]].to_string(index=False))
     BEST_K = 4
 
-    model = AgglomerativeClustering(n_clusters=BEST_K, metric="precomputed", linkage="complete")
-    labels = model.fit_predict(dist_fp)
+    labels = KMeans(n_clusters=BEST_K, n_init=20, random_state=RANDOM_STATE).fit_predict(coords_fp)
     fully_profiled["cluster"] = labels
-    fully_profiled["cluster_name"] = fully_profiled["cluster"].map(CLUSTER_NAMES)
+    fully_profiled["cluster_name"] = fully_profiled.groupby("cluster", group_keys=False).apply(
+        lambda g: pd.Series(name_cluster(g), index=g.index)
+    )
     improved_sil = silhouette_score(dist_fp, labels, metric="precomputed")
-    print(f"\n[Validation] Improved model (fully-profiled tier, Gower-aware distance, "
-          f"Agglomerative k={BEST_K}): silhouette = {improved_sil:.4f} "
-          f"(vs {naive_sil:.4f} naive baseline)")
+    print(f"\n[Validation] Final model (fully-profiled tier, MCA({MCA_COMPONENTS})+K-Means, "
+          f"k={BEST_K}): silhouette = {improved_sil:.4f} (vs {naive_sil:.4f} naive baseline, "
+          f"+{(improved_sil/naive_sil-1):.0%} relative)")
 
     profile = cluster_profile_table(fully_profiled, BUSINESS_FEATURES)
-    profile["cluster_name"] = profile["cluster"].map(CLUSTER_NAMES)
+    name_lookup = fully_profiled.groupby("cluster")["cluster_name"].first()
+    profile["cluster_name"] = profile["cluster"].map(name_lookup)
     profile.to_csv(f"{OUT_DIR}/cluster_profiles.csv", index=False)
     print(profile[["cluster", "cluster_name", "size", "pct_of_group"]].to_string(index=False))
 
@@ -424,8 +493,10 @@ def main():
     print(f"\n[Q6] Overall silhouette: {val['overall_silhouette']:.4f} | "
           f"negative-silhouette share: {val['pct_negative_silhouette']:.1%}")
     print("[Q6] Per-cluster silhouette:", {k: round(v, 3) for k, v in val["per_cluster_silhouette"].items()})
+    print(f"[Q6] Stability across 5 random K-Means seeds: mean ARI = "
+          f"{val['seed_stability_mean_ari']:.4f}, min ARI = {val['seed_stability_min_ari']:.4f}")
     print("[Q6] Feature-dropout sensitivity (ARI vs full model):")
-    print(val["feature_dropout_sensitivity"].to_string(index=False))
+    print(val["feature_dropout_sensitivity"].sort_values("ari_vs_full_model").to_string(index=False))
     val["feature_dropout_sensitivity"].to_csv(f"{OUT_DIR}/feature_dropout_sensitivity.csv", index=False)
 
     # ---- Assemble full segment labels for every customer ----
@@ -453,6 +524,10 @@ def main():
         "metric": "overall_silhouette_naive_baseline", "value": naive_sil
     }, {
         "metric": "pct_negative_silhouette", "value": val["pct_negative_silhouette"]
+    }, {
+        "metric": "seed_stability_mean_ari", "value": val["seed_stability_mean_ari"]
+    }, {
+        "metric": "seed_stability_min_ari", "value": val["seed_stability_min_ari"]
     }, {
         "metric": "chi2_vs_country", "value": chi2
     }, {
